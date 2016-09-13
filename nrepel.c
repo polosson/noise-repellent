@@ -32,6 +32,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/
 #include "lv2/lv2plug.in/ns/ext/atom/util.h"
 #include "lv2/lv2plug.in/ns/ext/urid/urid.h"
 #include "lv2/lv2plug.in/ns/ext/state/state.h"
+#include "lv2/lv2plug.in/ns/ext/log/log.h"
+#include "lv2/lv2plug.in/ns/ext/log/logger.h"
 
 #define NREPEL_URI "https://github.com/lucianodato/noise-repellent"
 #define NREPEL_NPRINT "http://example.org/noise-repellent/noise_print"
@@ -67,6 +69,12 @@ typedef enum {
 	NREPEL_INPUT = 11,
 	NREPEL_OUTPUT = 12,
 } PortIndex;
+
+//URIs
+typedef struct {
+	LV2_URID atom_Vector;
+	LV2_URID noise_print;
+} NrepelURIs;
 
 typedef struct {
 	const float* input; //input of samples from host (changing size)
@@ -144,15 +152,12 @@ typedef struct {
 	// clock_t start, end;
 	// double cpu_time_used;
 
-	// Features
+	// Features and URI mapping
   LV2_URID_Map* map;
-
-	//URIS
-	struct {
-          LV2_URID atom_Vector;
-          LV2_URID noise_print;
-  } uris;
-
+	NrepelURIs uris;
+	// Log feature and convenience API
+	LV2_Log_Log* log;
+  LV2_Log_Logger logger;
 
 } Nrepel;
 
@@ -162,44 +167,39 @@ instantiate(const LV2_Descriptor*     descriptor,
 						const char*               bundle_path,
 						const LV2_Feature* const* features) {
 
-  //FEATURES
-	LV2_URID_Map* map = NULL;
-  for (int i = 0; features[i]; ++i) {
-    if (!strcmp(features[i]->URI, LV2_URID__map)) {
-      map = (LV2_URID_Map*)features[i]->data;
-      break;
-    }
-  }
-  // if (!map) {
-	// 	return NULL;
-  // }
-
 	//Actual struct declaration
 	Nrepel* nrepel = (Nrepel*)malloc(sizeof(Nrepel));
 
-	//URIS and FEATURES
-	nrepel->map = map;
-	nrepel->uris.noise_print = map->map(map->handle, LV2_ATOM__Vector);
 
-	//States
+  //FEATURES
+	// Scan host features for URID map
+	 LV2_URID_Map* map = NULL;
+	 // Get host features
+  for (int i = 0; features[i]; ++i) {
+    if (!strcmp(features[i]->URI, LV2_URID__map)) {
+      nrepel->map = (LV2_URID_Map*)features[i]->data;
+    } else if (!strcmp(features[i]->URI, LV2_LOG__log)) {
+      nrepel->log = (LV2_Log_Log*)features[i]->data;
+    }
+  }
+	if (!nrepel->map) {
+    fprintf(stderr, "Noise Repellent error: Host does not support urid:map\n");
+    free(nrepel);
+    return NULL;
+  }
+
+	// Map URIs
+	NrepelURIs* const uris = &nrepel->uris;
+	nrepel->map = map;
 	nrepel->uris.atom_Vector = map_uri(LV2_ATOM__Vector);
 	nrepel->uris.noise_print = map_uri(NREPEL_NPRINT "Noise Print");
 	//nrepel->state.noise_print = ; //State buffer initialization
 
+	//Initialise logger
+  lv2_log_logger_init(&nrepel->logger, nrepel->map, nrepel->log);
+
 	//Initialize variables
 	nrepel->samp_rate = rate;
-	nrepel->fft_size = FFT_SIZE;
-	nrepel->window_combination = WINDOW_COMBINATION;
-	nrepel->overlap_factor = OVERLAP_FACTOR;
-	nrepel->max_float = FLT_MAX;
-	nrepel->wa = WA;
-	nrepel->window_count = 0.f;
-	nrepel->tau = (1.f - exp (-2.f * M_PI * 25.f * 64.f  / nrepel->samp_rate));
-
-	nrepel->fft_size_2 = nrepel->fft_size/2;
-	nrepel->hop = nrepel->fft_size/nrepel->overlap_factor;
-	nrepel->input_latency = nrepel->fft_size - nrepel->hop;
-	nrepel->read_ptr = nrepel->input_latency; //the initial position because we are that many samples ahead
 
 	nrepel->in_fifo = (float*)calloc(nrepel->fft_size,sizeof(float));
 	nrepel->out_fifo = (float*)calloc(nrepel->fft_size,sizeof(float));
@@ -207,25 +207,6 @@ instantiate(const LV2_Descriptor*     descriptor,
 
 	nrepel->window_input = (float*)calloc(nrepel->fft_size,sizeof(float));
 	nrepel->window_output = (float*)calloc(nrepel->fft_size,sizeof(float));
-	//Window combination computing
-	switch(nrepel->window_combination){
-		case 0: // HANN-HANN
-			fft_window(nrepel->window_input,nrepel->fft_size,0); //STFT input window
-			fft_window(nrepel->window_output,nrepel->fft_size,0); //STFT output window
-			nrepel->overlap_scale_factor = HANN_HANN_SCALING;
-			break;
-		case 1: //HAMMING-HANN
-			fft_window(nrepel->window_input,nrepel->fft_size,1); //STFT input window
-			fft_window(nrepel->window_output,nrepel->fft_size,0); //STFT output window
-			nrepel->overlap_scale_factor = HAMMING_HANN_SCALING;
-			break;
-		case 2: //BLACKMAN-HANN
-			fft_window(nrepel->window_input,nrepel->fft_size,2); //STFT input window
-			fft_window(nrepel->window_output,nrepel->fft_size,0); //STFT output window
-			nrepel->overlap_scale_factor = BLACKMAN_HANN_SCALING;
-			break;
-
-	}
 
 	nrepel->input_fft_buffer = (float*)calloc(nrepel->fft_size,sizeof(float));
 	nrepel->output_fft_buffer = (float*)calloc(nrepel->fft_size,sizeof(float));
@@ -238,30 +219,13 @@ instantiate(const LV2_Descriptor*     descriptor,
 	nrepel->noise_thresholds = (float*)calloc((nrepel->fft_size_2+1),sizeof(float));
 	nrepel->auto_thresholds = (float*)calloc((nrepel->fft_size_2+1),sizeof(float));
 
-	//This is experimentally obteined
-	int LF = Freq2Index(1000.f,nrepel->samp_rate,nrepel->fft_size);//1kHz
-	int MF = Freq2Index(3000.f,nrepel->samp_rate,nrepel->fft_size);//3kHz
-	for (int k = 0;k <= nrepel->fft_size_2; k++){
-		if(k < LF){
-			nrepel->auto_thresholds[k] = 2.f;
-		}
-		if(k > LF && k < MF){
-			nrepel->auto_thresholds[k] = 2.f;
-		}
-		if(k > MF){
-			nrepel->auto_thresholds[k] = 5.f;
-		}
-	}
-
 	nrepel->Gk = (float*)malloc((nrepel->fft_size_2+1)*sizeof(float));
-	memset(nrepel->Gk, 1, (nrepel->fft_size_2+1)*sizeof(float));
 
 	nrepel->denoised_fft_buffer = (float*)calloc(nrepel->fft_size,sizeof(float));
 	nrepel->residual_spectrum = (float*)calloc((nrepel->fft_size),sizeof(float));
 
 	nrepel->whitening_spectrum = (float*)calloc((nrepel->fft_size_2+1),sizeof(float));
 	nrepel->tappering_filter = (float*)calloc(nrepel->fft_size_2+1,sizeof(float));
-	tappering_filter_calc(nrepel->tappering_filter,(nrepel->fft_size_2+1),WA); //Tappering window
 
   nrepel->prev_noise_thresholds = (float*)calloc((nrepel->fft_size_2+1),sizeof(float));
 	nrepel->s_pow_spec = (float*)calloc((nrepel->fft_size_2+1),sizeof(float));
@@ -328,28 +292,62 @@ connect_port(LV2_Handle instance,
 static void
 activate(LV2_Handle instance)
 {
+	Nrepel* nrepel = (Nrepel*)instance;
+
+	nrepel->fft_size = FFT_SIZE;
+	nrepel->window_combination = WINDOW_COMBINATION;
+	nrepel->overlap_factor = OVERLAP_FACTOR;
+	nrepel->max_float = FLT_MAX;
+	nrepel->wa = WA;
+	nrepel->window_count = 0.f;
+	nrepel->tau = (1.f - exp (-2.f * M_PI * 25.f * 64.f  / nrepel->samp_rate));
+
+	nrepel->fft_size_2 = nrepel->fft_size/2;
+	nrepel->hop = nrepel->fft_size/nrepel->overlap_factor;
+	nrepel->input_latency = nrepel->fft_size - nrepel->hop;
+	nrepel->read_ptr = nrepel->input_latency; //the initial position because we are that many samples ahead
+
+	//Window combination computing
+	switch(nrepel->window_combination){
+		case 0: // HANN-HANN
+			fft_window(nrepel->window_input,nrepel->fft_size,0); //STFT input window
+			fft_window(nrepel->window_output,nrepel->fft_size,0); //STFT output window
+			nrepel->overlap_scale_factor = HANN_HANN_SCALING;
+			break;
+		case 1: //HAMMING-HANN
+			fft_window(nrepel->window_input,nrepel->fft_size,1); //STFT input window
+			fft_window(nrepel->window_output,nrepel->fft_size,0); //STFT output window
+			nrepel->overlap_scale_factor = HAMMING_HANN_SCALING;
+			break;
+		case 2: //BLACKMAN-HANN
+			fft_window(nrepel->window_input,nrepel->fft_size,2); //STFT input window
+			fft_window(nrepel->window_output,nrepel->fft_size,0); //STFT output window
+			nrepel->overlap_scale_factor = BLACKMAN_HANN_SCALING;
+			break;
+	}
+
+	//This is experimentally obteined
+	int LF = Freq2Index(1000.f,nrepel->samp_rate,nrepel->fft_size);//1kHz
+	int MF = Freq2Index(3000.f,nrepel->samp_rate,nrepel->fft_size);//3kHz
+	for (int k = 0;k <= nrepel->fft_size_2; k++){
+		if(k < LF){
+			nrepel->auto_thresholds[k] = 2.f;
+		}
+		if(k > LF && k < MF){
+			nrepel->auto_thresholds[k] = 2.f;
+		}
+		if(k > MF){
+			nrepel->auto_thresholds[k] = 5.f;
+		}
+	}
+
+	//Set initial gain to apply to unity
+	memset(nrepel->Gk, 1, (nrepel->fft_size_2+1)*sizeof(float));
+
+	//Tappering window
+	tappering_filter_calc(nrepel->tappering_filter,(nrepel->fft_size_2+1),WA);
+
 }
-
-LV2_State_Status
-my_save(LV2_Handle                 instance,
-        LV2_State_Store_Function   store,
-        LV2_State_Handle           handle,
-        uint32_t                   flags,
-        const LV2_Feature *const * features)
-{
-    Nrepel*   nrepel   = (Nrepel*)instance;
-    const float* noise_print = nrepel->state.noise_print;
-
-    store(handle,
-          plugin->uris.noise_print,
-          noise_print,
-          nrepel->fft_size + 1,  // Careful!  Need space for terminator
-          plugin->uris.atom_Vector,
-          LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE);
-
-    return LV2_STATE_SUCCESS;
-}
-
 
 static void
 run(LV2_Handle instance, uint32_t n_samples) {
@@ -594,10 +592,53 @@ cleanup(LV2_Handle instance)
 	free(instance);
 }
 
-const void*
-extension_data(const char* uri)
-{
-	return NULL;
+static LV2_State_Status
+state_save(LV2_Handle                instance,
+           LV2_State_Store_Function  store,
+           LV2_State_Handle          handle,
+           uint32_t                  flags,
+           const LV2_Feature* const* features) {
+    Nrepel* nrepel = (Nrepel*)instance;
+
+		if (!nrepel) {
+      return LV2_STATE_SUCCESS;
+    }
+
+    store(handle, nrepel->uris.noise_print,
+          (void*)&nrepel->noise_thresholds, sizeof(float)*nrepel->fft_size,
+          nrepel->uris.atom_Vector,
+          LV2_STATE_IS_POD);
+
+    return LV2_STATE_SUCCESS;
+}
+
+static LV2_State_Status
+state_restore(LV2_Handle                  instance,
+              LV2_State_Retrieve_Function retrieve,
+              LV2_State_Handle            handle,
+              uint32_t                    flags,
+              const LV2_Feature* const*   features) {
+    Nrepel* nrepel = (Nrepel*)instance;
+
+    size_t   size;
+    uint32_t type;
+    uint32_t valflags;
+
+    float* noise_print = retrieve(handle, nrepel->uris.noise_print, &size, &type, &valflags);
+    if (noise_print && size == sizeof(float)*nrepel->fft_size && type == nrepel->uris.atom_Vector) {
+      nrepel->noise_thresholds = ((float*)noise_print);
+    }
+
+    return LV2_STATE_SUCCESS;
+}
+
+static const void*
+extension_data(const char* uri) {
+  static const LV2_State_Interface state = { state_save, state_restore };
+  if (!strcmp(uri, LV2_STATE__interface)) {
+    return &state;
+  }
+  return NULL;
 }
 
 static const
