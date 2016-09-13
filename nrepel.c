@@ -28,9 +28,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/
 #include "denoise_gain.c"
 
 #include "lv2/lv2plug.in/ns/lv2core/lv2.h"
+#include "lv2/lv2plug.in/ns/ext/atom/atom.h"
+#include "lv2/lv2plug.in/ns/ext/atom/util.h"
+#include "lv2/lv2plug.in/ns/ext/urid/urid.h"
+#include "lv2/lv2plug.in/ns/ext/state/state.h"
 
 #define NREPEL_URI "https://github.com/lucianodato/noise-repellent"
-#define NS_MY "http://example.org/myplugin/schema#"
+#define NREPEL_NPRINT "http://example.org/noise-repellent/noise_print"
 
 //STFT default values (This are standart values)
 #define FFT_SIZE 2048 //max should be 8192 otherwise is too expensive
@@ -140,7 +144,14 @@ typedef struct {
 	// clock_t start, end;
 	// double cpu_time_used;
 
-	//States
+	// Features
+  LV2_URID_Map* map;
+
+	//URIS
+	struct {
+          LV2_URID atom_Vector;
+          LV2_URID noise_print;
+  } uris;
 
 
 } Nrepel;
@@ -150,10 +161,30 @@ instantiate(const LV2_Descriptor*     descriptor,
 						double                    rate,
 						const char*               bundle_path,
 						const LV2_Feature* const* features) {
+
+  //FEATURES
+	LV2_URID_Map* map = NULL;
+  for (int i = 0; features[i]; ++i) {
+    if (!strcmp(features[i]->URI, LV2_URID__map)) {
+      map = (LV2_URID_Map*)features[i]->data;
+      break;
+    }
+  }
+  // if (!map) {
+	// 	return NULL;
+  // }
+
 	//Actual struct declaration
 	Nrepel* nrepel = (Nrepel*)malloc(sizeof(Nrepel));
 
+	//URIS and FEATURES
+	nrepel->map = map;
+	nrepel->uris.noise_print = map->map(map->handle, LV2_ATOM__Vector);
+
 	//States
+	nrepel->uris.atom_Vector = map_uri(LV2_ATOM__Vector);
+	nrepel->uris.noise_print = map_uri(NREPEL_NPRINT "Noise Print");
+	//nrepel->state.noise_print = ; //State buffer initialization
 
 	//Initialize variables
 	nrepel->samp_rate = rate;
@@ -298,6 +329,27 @@ static void
 activate(LV2_Handle instance)
 {
 }
+
+LV2_State_Status
+my_save(LV2_Handle                 instance,
+        LV2_State_Store_Function   store,
+        LV2_State_Handle           handle,
+        uint32_t                   flags,
+        const LV2_Feature *const * features)
+{
+    Nrepel*   nrepel   = (Nrepel*)instance;
+    const float* noise_print = nrepel->state.noise_print;
+
+    store(handle,
+          plugin->uris.noise_print,
+          noise_print,
+          nrepel->fft_size + 1,  // Careful!  Need space for terminator
+          plugin->uris.atom_Vector,
+          LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE);
+
+    return LV2_STATE_SUCCESS;
+}
+
 
 static void
 run(LV2_Handle instance, uint32_t n_samples) {
